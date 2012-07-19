@@ -292,7 +292,7 @@ cmd_fromreview() {
 
 	# Sanity check that this commit is based on the develop branch
 	[ "$(git_get_first_feature_branch_commit HEAD)" == "$(git rev-parse HEAD)" ] \
-		|| fail "Gerrit commit not direct descendent of $DEVELOP_BRANCH"
+		|| fail "Gerrit commit not direct descendent of $DEVELOP_BRANCH. Try pull'ing the latest develop."
 
 	old_change_id=$(git_change_id HEAD) || fail "Couldn't determine Change-Id"
 	new_change_id=$(git_derived_change_id review HEAD) || fail "Couldn't determine Change-Id"
@@ -326,23 +326,35 @@ cmd_publish() {
 	# sanity checks
 	require_clean_working_tree
 	require_branch "$BRANCH"
-	git fetch -q "$ORIGIN"
+	local err=$(git fetch -q "$ORIGIN" "$BRANCH:refs/remotes/$ORIGIN/$BRANCH" 2>&1 | grep "Couldn't find remote ref")
+	if [ "$err" ]; then
+		rm $DOT_GIT_DIR/refs/remotes/$ORIGIN/$BRANCH 2>/dev/null
+	fi
 	if has "$ORIGIN/$BRANCH" $(git_all_branches); then
-		warn "*** ERROR: A remote feature branch with the same name ($BRANCH) already exists."
-		warn ""
-		if [ "$(git config --get "branch.$BRANCH.remote")" ]; then
-			warn "If you want to contribute to an already shared branch, use: "
-			warn "     git push"
-		else
-			warn "To select a different name for your branch, use:"
-			warn "     git branch -m $BRANCH <newname>"
+		err=$(git push $ORIGIN "$BRANCH:refs/heads/$BRANCH" 2>&1)
+		echo "$err"
+		if [ "$(echo "$err" | grep "non-fast-forward updates were rejected")" ]; then
+			warn ""
+			warn "*** ERROR: Couldn't push your branch."
+			warn ""
+			if [ "$(git config --get "branch.$BRANCH.remote")" ]; then
+				warn "    The remote feature branch could not be fast-forwarded."
+				warn ""
+				warn "    Use 'git pull --rebase' to get the latest changes from the server."
+			else
+				warn "    A feature branch named '$BRANCH' already exists on the server."
+				warn ""
+				warn "    To select a different name for your branch, use:"
+				warn "      git branch -m ${BRANCH} ${PREFIX}<newname>"
+			fi
+			die ""
 		fi
-		die ""
+		exit 0
 	fi
 
 	# create remote branch
 	git push "$ORIGIN" "$BRANCH:refs/heads/$BRANCH"
-	git fetch -q "$ORIGIN"
+	#git fetch -q "$ORIGIN" "$BRANCH:refs/remotes/$ORIGIN/$BRANCH"
 
 	# configure remote tracking
 	git config "branch.$BRANCH.remote" "$ORIGIN"
@@ -561,7 +573,10 @@ git_symbolic_head() {
 }
 
 git_is_clean_merge() {
-	git format-patch --stdout "$(git merge-base HEAD "$1")..$1" | git apply --check - 2>/dev/null
+	git merge --no-commit --no-ff "$1" >/dev/null 2>/dev/null
+	local status=$?
+	git reset -q --hard
+	return $status
 }
 
 ask() {
@@ -591,7 +606,7 @@ nth_string () {
 }
 
 generate_squash_message() {
-	local commits=$(git log --pretty=format:%H "$1^..$2" | cat -n | sort -nr | cut -f 2-)
+	local commits=$(git log --reverse --no-merges --first-parent --pretty=format:%H "$BRANCH" ^"$DEVELOP_BRANCH")
 	local count=$(echo "$commits" | wc -l)
 	[ "$count" -eq 0 ] && return 1
 	[ "$count" -eq 1 ] && {
@@ -606,6 +621,13 @@ generate_squash_message() {
 		echo
 		commit_message "$(echo "$commits" | sed -n "$i p")" | sed '/^Change-Id:/d'
 	done
+
+	# If more than one commits are squashed, add stripped commit template in the end.
+	local template=$(git config commit.template)
+	if [ -f "$template" ]; then
+		echo
+		cat "$template" | sed '/^\s*#/d;/^\s*$/d'
+	fi
 }
 
 get_feature_commit_message() {
@@ -619,12 +641,12 @@ get_feature_commit_message() {
 	local message_change_id=$(git_derived_change_id message "$first_feature_commit")
 
 	# If there is a commit in the feature branch with 'message_change_id', use that for the squash commit message
-	local feature_message_commit=$( git log -1 --pretty=format:%H --grep="^Change-Id: $message_change_id" "$first_feature_commit^..$BRANCH" )
+	local feature_message_commit=$(git log -1 --pretty=format:%H --grep="^Change-Id: $message_change_id" "$BRANCH" ^"$DEVELOP_BRANCH")
 	if [ "$feature_message_commit" ]; then 
-		local commit_message=$( commit_message "$feature_message_commit" )
+		local commit_message=$(commit_message "$feature_message_commit")
 	else
 		# Commit message has not been edited yet -> generate from all commits in feature branch
-		local commit_message=$(generate_squash_message "$first_feature_commit" "$BRANCH" )
+		local commit_message=$(generate_squash_message)
 	fi
 
 	echo "$commit_message" | replace_change_id "$feature_change_id"
@@ -639,7 +661,7 @@ edit_feature_commit_message() {
 	local feature_change_id=$(git_derived_change_id review "$first_feature_commit")
 	local message_change_id=$(git_derived_change_id message "$first_feature_commit")
 
-	local initial_commit_message=$(get_feature_commit_message)
+	local initial_commit_message=$(get_feature_commit_message | replace_change_id)
 
 	( echo "# This is the commit message for the entire feature branch you are submitting to Gerrit."
 	  echo "# Changes made to this message will be recorded as a new commit in your feature branch."
@@ -647,9 +669,9 @@ edit_feature_commit_message() {
 	  echo "$initial_commit_message") > $DOT_GIT_DIR/COMMIT_EDITMSG
 
 	# Create a commit with the initial commit message
-	git commit --quiet --allow-empty --file=$DOT_GIT_DIR/COMMIT_EDITMSG --edit || exit 1
+	git commit --quiet --allow-empty --file=$DOT_GIT_DIR/COMMIT_EDITMSG --edit || die "Submit aborted due to empty commit message."
 
-	if [ "$(commit_message HEAD | replace_change_id "$feature_change_id")" == "$initial_commit_message" ]; then
+	if [ "$(commit_message HEAD | replace_change_id)" == "$initial_commit_message" ]; then
 		# Remove commit if nothing changes
 		git reset -q --hard HEAD^ # Commit message not changed, delete empty commit
 	else
@@ -922,7 +944,6 @@ cmd_log() {
 	fi
 	require_feature_branch "$BRANCH"
 
-	local first_feature_commit=$(git_get_first_feature_branch_commit "$BRANCH")
-	git log "${first_feature_commit}^..${BRANCH}" $@
+	git log --first-parent "$BRANCH" ^"$DEVELOP_BRANCH" $@
 }
 
