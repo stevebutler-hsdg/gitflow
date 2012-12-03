@@ -83,8 +83,23 @@ git_remote_branches() { git branch -r --no-color | sed 's/^[* ] //'; }
 git_all_branches() { ( git branch --no-color; git branch -r --no-color) | sed 's/^[* ] //'; }
 git_all_tags() { git tag; }
 
+git_local_develop_branches() { git_local_branches | sed '/^feature\//d; /\/*develop$/!d'; }
+git_remote_develop_branches() { git_remote_branches | sed '/^origin\//!d; /->/d; s/^origin\///; /^feature\//d; /\/*develop$/!d'; }
+git_all_develop_branches() { (git_local_develop_branches; git_remote_develop_branches) | sort -u; }
+git_namespaces() { git_all_develop_branches | sed 's/\/*develop//'; }
+
 git_current_branch() {
 	git branch --no-color | grep '^\* ' | grep -v 'no branch' | sed 's/^* //g'
+}
+
+git_current_namespace() {
+	local branch=$(git_current_branch)
+	for ns in $(git_namespaces); do
+		if [ "${branch#$ns/}" != "$branch" ]; then
+			echo "$ns/"
+			return 0
+		fi
+	done
 }
 
 git_is_clean_working_tree() {
@@ -171,8 +186,7 @@ gitflow_has_master_configured() {
 }
 
 gitflow_has_develop_configured() {
-	local develop=$(git config --get gitflow.branch.develop)
-	[ "$develop" != "" ] && git_local_branch_exists "$develop"
+	[ "$(git_local_branches | sed '/\/*develop$/!d')" != "" ]
 }
 
 gitflow_has_prefixes_configured() {
@@ -184,12 +198,14 @@ gitflow_has_prefixes_configured() {
 }
 
 gitflow_is_initialized() {
-	gitflow_has_master_configured                    && \
-	gitflow_has_develop_configured                   && \
-	[ "$(git config --get gitflow.branch.master)" !=    \
-	  "$(git config --get gitflow.branch.develop)" ] && \
-	gitflow_has_prefixes_configured
+	gitflow_configure_prefixes && \
+	gitflow_has_develop_configured 
 }
+
+gitflow_configure_prefixes() {
+	git config gitflow.prefix.feature feature/
+}
+
 
 # loading settings that can be overridden using git config
 gitflow_load_settings() {
