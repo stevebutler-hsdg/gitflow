@@ -36,25 +36,36 @@
 # policies, either expressed or implied, of Vincent Driessen.
 #
 
+init
+
+init() {
 require_git_repo
 require_gitflow_initialized
 gitflow_load_settings
-
 PREFIX=$(git config --get gitflow.prefix.feature)
+PROJECT_PREFIX=project
 DEVELOP_NAME=$(git config --get gitflow.branch.develop)
-DEVELOP_NAME=${DEVELOP_BRANCH:-develop}
+DEVELOP_NAME=${DEVELOP_NAME:-develop}
+NS=$(git_current_namespace)
+DEVELOP_BRANCH=${NS}${DEVELOP_NAME}
+PREFIX=${NS}${PREFIX}
+PROJECT=$(git_current_branch | sed -n "s,^${PREFIX}\\([^/]*\\)/.*,\\1,p")
+[ "$PROJECT" ] || PROJECT=$(git_current_branch | sed -n "s,^${NS}${PROJECT_PREFIX}/\\([^/]*\\)\$,\\1,p")
+[ "$PROJECT" ] && PREFIX=${PREFIX}${PROJECT}/
+[ "$PROJECT" ] && DEVELOP_BRANCH=${NS}${PROJECT_PREFIX}/${PROJECT}
+}
 
-if [ "$(git_current_namespace)" ]; then
-	PREFIX=$(git_current_namespace)/$PREFIX
-	DEVELOP_BRANCH=$(git_current_namespace)/${DEVELOP_NAME}
-else
-	DEVELOP_BRANCH=${DEVELOP_NAME}
-fi
+cmd_test() {
+	echo "NS = $NS"
+	echo "PROJECT = $PROJECT"
+	echo "PREFIX = $PREFIX"
+	echo "DEVELOP = $DEVELOP_BRANCH"
+}
 
 usage() {
 	echo "usage: git flow feature [list] [-v]"
 	echo "       git flow feature start [-F] <name> [<base>]"
-	echo "       git flow feature submit [<name|nameprefix>]"
+	echo "       git flow feature finish [-rFkDS] [<name|nameprefix>]"
 	echo "       git flow feature delete [<name|nameprefix>]"
 	echo "       git flow feature publish <name>"
 	echo "       git flow feature track <name>"
@@ -62,6 +73,14 @@ usage() {
 	echo "       git flow feature rebase [-i] [<name|nameprefix>]"
 	echo "       git flow feature checkout [<name|nameprefix>]"
 	echo "       git flow feature pull [-r] <remote> [<name>]"
+}
+
+init_restore_branch() {
+	trap "git checkout -q $(git_symbolic_head)" INT TERM EXIT
+}
+
+cancel_restore_branch() {
+	trap - INT TERM EXIT
 }
 
 cmd_default() {
@@ -152,6 +171,7 @@ expand_nameprefix_arg() {
 		   ;;
 		*) exit 1 ;;
 	esac
+	REMOTE_BRANCH=$(get_tracked_branch)
 }
 
 use_current_feature_branch_name() {
@@ -164,6 +184,7 @@ use_current_feature_branch_name() {
 		warn "Please specify a <name> argument."
 		exit 1
 	fi
+	REMOTE_BRANCH=$(get_tracked_branch)
 }
 
 expand_nameprefix_arg_or_current() {
@@ -181,6 +202,18 @@ name_or_current() {
 	fi
 }
 
+get_tracked_branch() {
+	[ "$(git config "branch.$BRANCH.remote")" == "$ORIGIN" ] || return 1
+	local remote_branch=$(git config "branch.$BRANCH.merge" | sed -n 's,^refs/heads/,,p')
+	[ "$remote_branch" ] || return 1
+	has "$ORIGIN/$remote_branch" $(git_remote_branches) || return 1
+	echo "$remote_branch"
+}
+
+has_tracked_branch() {
+	get_tracked_branch >/dev/null
+}
+
 parse_args() {
 	# parse options
 	FLAGS "$@" || exit $?
@@ -189,6 +222,7 @@ parse_args() {
 	# read arguments into global variables
 	NAME=$1
 	BRANCH=$PREFIX$NAME
+	REMOTE_BRANCH=$(get_tracked_branch)
 }
 
 parse_remote_name() {
@@ -203,23 +237,36 @@ parse_remote_name() {
 }
 
 gerrit_host() {
-	git config --get "remote.$ORIGIN.url" | sed 's,^ssh://\([^:]*\):\([^/]*\)/.*$,\1,'
+	local val
+	val=$(git config --get "remote.$ORIGIN.url" | sed 's,^ssh://\([^:]*\):\([^/]*\)/.*$,\1,')
+	[[ -z "$val" ]] && fail "Couldn't get gerrit host from config: remote.$ORIGIN.url"
+	echo $val
 }
 gerrit_port() {
-	git config --get "remote.$ORIGIN.url" | sed 's,^ssh://\([^:]*\):\([^/]*\)/.*$,\2,'
+	local val
+	val=$(git config --get "remote.$ORIGIN.url" | sed 's,^ssh://\([^:]*\):\([^/]*\)/.*$,\2,')
+	[[ -z "$val" ]] && fail "Couldn't get gerrit port from config: remote.$ORIGIN.url"
+	echo $val
 }
 gerrit_query() {
 	ssh -p $(gerrit_port) $(gerrit_host) "gerrit query $1"
 }
 gerrit_query_filter() {
-	res=$(cat)
+	local res=$(cat)
 	rows=$(echo "$res" | awk '/^rowCount:/ {print $2}')
 	[ "$rows" == "1" ] || return 1
 	local filter=$1
-	[ "$1" == "changeurl" ] && filter=
 	value=$(echo "$res" | sed -n "s/^\\s*$filter: //p")
 	[ "$value" ] || return 1
 	echo "$value"
+}
+gerrit_push() {
+	local err
+	err=$(git push "$ORIGIN" "$1" 2>&1) || {
+		echo "Gerrit Error: " >&2
+		echo "$err" | egrep '(error|!)' >&2
+		return 1
+	}
 }
 
 cmd_start() {
@@ -229,12 +276,18 @@ cmd_start() {
 	[ "$BASE" ] || fail "Could not determine which 'develop' to branch from. Specify a base explicitly."
 	require_name_arg
 
+        # If current branch is product branch, gitflow should give a warning and quit
+        current_branch_name=$(git_current_branch)
+        if [ "$(echo "$current_branch_name" | grep "/product")" ]; then
+                die "please don't use git flow on product branch"
+        fi
+
 	# sanity checks
 	require_branch_absent "$BRANCH"
 
 	# update the local repo with remote changes, if asked
 	if flag fetch; then
-		git fetch -q "$ORIGIN" "$DEVELOP_BRANCH"
+		git_do fetch -q "$ORIGIN" "$DEVELOP_BRANCH"
 	fi
 
 	# if the origin branch counterpart exists, assert that the local branch
@@ -267,6 +320,154 @@ cmd_start() {
 	echo
 }
 
+cmd_finish() {
+	DEFINE_boolean fetch false "fetch from $ORIGIN before performing finish" F
+	DEFINE_boolean rebase false "rebase instead of merge" r
+	DEFINE_boolean keep false "keep branch after performing finish" k
+	DEFINE_boolean force_delete false "force delete feature branch after finish" D
+	DEFINE_boolean squash false "squash feature during merge" S
+	parse_args "$@"
+	expand_nameprefix_arg_or_current
+
+	# sanity checks
+	require_branch "$BRANCH"
+
+	# detect if we're restoring from a merge conflict
+	if [ -f "$DOT_GIT_DIR/.gitflow/MERGE_BASE" ]; then
+		#
+		# TODO: detect that we're working on the correct branch here!
+		# The user need not necessarily have given the same $NAME twice here
+		# (although he/she should).
+		# 
+
+		# TODO: git_is_clean_working_tree() should provide an alternative
+		# exit code for "unmerged changes in working tree", which we should
+		# actually be testing for here
+		if git_is_clean_working_tree; then
+			FINISH_BASE=$(cat "$DOT_GIT_DIR/.gitflow/MERGE_BASE")
+
+			# Since the working tree is now clean, either the user did a
+			# succesfull merge manually, or the merge was cancelled.
+			# We detect this using git_is_branch_merged_into()
+			if git_is_branch_merged_into "$BRANCH" "$FINISH_BASE"; then
+				rm -f "$DOT_GIT_DIR/.gitflow/MERGE_BASE"
+				helper_finish_cleanup
+				exit 0
+			else
+				# If the user cancelled the merge and decided to wait until later,
+				# that's fine. But we have to acknowledge this by removing the
+				# MERGE_BASE file and continuing normal execution of the finish
+				rm -f "$DOT_GIT_DIR/.gitflow/MERGE_BASE"
+			fi
+		else
+			echo
+			echo "Merge conflicts not resolved yet, use:"
+			echo "    git mergetool"
+			echo "    git commit"
+			echo 
+			echo "You can then complete the finish by running it again:"
+			echo "    git flow feature finish $NAME"
+			echo
+			exit 1
+		fi
+	fi
+
+	# sanity checks
+	require_clean_working_tree
+
+	# update local repo with remote changes first, if asked
+	if has "$ORIGIN/$BRANCH" $(git_remote_branches); then
+		if flag fetch; then
+			git_do fetch -q "$ORIGIN" "$BRANCH"
+			git_do fetch -q "$ORIGIN" "$DEVELOP_BRANCH"
+		fi
+	fi
+
+	if has "$ORIGIN/$BRANCH" $(git_remote_branches); then
+		require_branches_equal "$BRANCH" "$ORIGIN/$BRANCH"
+	fi
+	if has "$ORIGIN/$DEVELOP_BRANCH" $(git_remote_branches); then
+		require_branches_equal "$DEVELOP_BRANCH" "$ORIGIN/$DEVELOP_BRANCH"
+	fi
+
+	# if the user wants to rebase, do that first
+	if flag rebase; then
+		if ! git flow feature rebase "$NAME" "$DEVELOP_BRANCH"; then
+			warn "Finish was aborted due to conflicts during rebase."
+			warn "Please finish the rebase manually now."
+			warn "When finished, re-run:"
+			warn "    git flow feature finish '$NAME' '$DEVELOP_BRANCH'"
+			exit 1
+		fi
+	fi
+
+	# merge into BASE
+	git_do checkout "$DEVELOP_BRANCH"
+	if [ "$(git rev-list -n2 "$DEVELOP_BRANCH..$BRANCH" | wc -l)" -eq 1 ]; then
+		git_do merge --ff "$BRANCH"
+	else
+		if noflag squash; then
+		    git_do merge --no-ff "$BRANCH"
+		else
+			git_do merge --squash "$BRANCH"
+			git_do commit
+			git_do merge "$BRANCH"
+		fi
+	fi
+
+	if [ $? -ne 0 ]; then
+		# oops.. we have a merge conflict!
+		# write the given $DEVELOP_BRANCH to a temporary file (we need it later)
+		mkdir -p "$DOT_GIT_DIR/.gitflow"
+		echo "$DEVELOP_BRANCH" > "$DOT_GIT_DIR/.gitflow/MERGE_BASE"
+		echo
+		echo "There were merge conflicts. To resolve the merge conflict manually, use:"
+		echo "    git mergetool"
+		echo "    git commit"
+		echo 
+		echo "You can then complete the finish by running it again:"
+		echo "    git flow feature finish $NAME"
+		echo
+		exit 1
+	fi
+
+	# when no merge conflict is detected, just clean up the feature branch
+	helper_finish_cleanup
+}
+
+helper_finish_cleanup() {
+	# sanity checks
+	require_branch "$BRANCH"
+	require_clean_working_tree
+
+	# delete branch
+	if flag fetch; then
+		git_do push "$ORIGIN" ":refs/heads/$BRANCH"
+	fi
+	
+	
+	if noflag keep; then
+		if flag force_delete; then
+			git_do branch -D "$BRANCH"
+		else
+			git_do branch -d "$BRANCH"
+		fi
+	fi
+
+	echo
+	echo "Summary of actions:"
+	echo "- The feature branch '$BRANCH' was merged into '$DEVELOP_BRANCH'"
+	#echo "- Merge conflicts were resolved"		# TODO: Add this line when it's supported
+	if flag keep; then
+		echo "- Feature branch '$BRANCH' is still available"
+	else
+		echo "- Feature branch '$BRANCH' has been removed"
+	fi
+	echo "- You are now on branch '$DEVELOP_BRANCH'"
+	echo
+}
+
+
 cmd_fromreview() {
 	info=$(gerrit_query "commit:$(git rev-parse HEAD)") \
 		|| fail "Couldn't contact Gerrit"
@@ -281,8 +482,13 @@ cmd_fromreview() {
 	
 	DEVELOP_BRANCH=$(echo "$info" | gerrit_query_filter branch) \
 		|| fail "Couldn't query Gerrit to get information about the change."
-	PREFIX=$(echo "$DEVELOP_BRANCH" | sed -n "s|/$DEVELOP_NAME\$|/feature/|p")
-	[ "$PREFIX" ] || fail "Couldn't detect valid develop branch from Gerrit change: '$DEVELOP_BRANCH'"
+	[ $(echo "$DEVELOP_BRANCH" | sed -n "s,^\([^/]*/\)\?\($DEVELOP_NAME\|$PROJECT_PREFIX/\([^/]\+\)\)$,\2,p") ] || \
+		fail "Couldn't detect valid develop branch from Gerrit change: '$DEVELOP_BRANCH'"
+	NS=$(echo "$DEVELOP_BRANCH" | sed -n "s,^\([^/]*/\)\?\($DEVELOP_NAME\|$PROJECT_PREFIX/\([^/]\+\)\)$,\1,p")
+	PROJECT=$(echo "$DEVELOP_BRANCH" | sed -n "s,^\([^/]*/\)\?\($DEVELOP_NAME\|$PROJECT_PREFIX/\([^/]\+\)\)$,\3,p")
+	PREFIX=$(git config --get gitflow.prefix.feature)
+	PREFIX=${NS}${PREFIX}
+	[ "$PROJECT" ] && PREFIX=${PREFIX}${PROJECT}/
 
 	parse_args "$@"
 	require_name_arg
@@ -326,7 +532,7 @@ cmd_publish() {
 	# sanity checks
 	require_clean_working_tree
 	require_branch "$BRANCH"
-	local err=$(git fetch -q "$ORIGIN" "$BRANCH:refs/remotes/$ORIGIN/$BRANCH" 2>&1 | grep "Couldn't find remote ref")
+	local err=$(git fetch -q "$ORIGIN" "refs/heads/$BRANCH:refs/remotes/$ORIGIN/$BRANCH" 2>&1 | grep "Couldn't find remote ref")
 	if [ "$err" ]; then
 		rm $DOT_GIT_DIR/refs/remotes/$ORIGIN/$BRANCH 2>/dev/null
 	fi
@@ -354,7 +560,7 @@ cmd_publish() {
 
 	# create remote branch
 	git push "$ORIGIN" "$BRANCH:refs/heads/$BRANCH"
-	#git fetch -q "$ORIGIN" "$BRANCH:refs/remotes/$ORIGIN/$BRANCH"
+	git fetch -q "$ORIGIN" "refs/heads/$BRANCH:refs/remotes/$ORIGIN/$BRANCH"
 
 	# configure remote tracking
 	git config "branch.$BRANCH.remote" "$ORIGIN"
@@ -377,7 +583,7 @@ cmd_track() {
 	# sanity checks
 	require_clean_working_tree
 	require_branch_absent "$BRANCH"
-	git fetch -q "$ORIGIN" "$BRANCH:refs/remotes/$ORIGIN/$BRANCH"
+	git fetch -q "$ORIGIN" "refs/heads/$BRANCH:refs/remotes/$ORIGIN/$BRANCH"
 	require_branch "$ORIGIN/$BRANCH"
 
 	# create tracking branch
@@ -393,29 +599,12 @@ cmd_track() {
 	echo
 }
 
-cmd_diff() {
-	parse_args "$@"
-
-	if [ "$NAME" != "" ]; then
-		expand_nameprefix_arg
-		BASE=$(git merge-base "$DEVELOP_BRANCH" "$BRANCH")
-		git diff "$BASE..$BRANCH"
-	else
-		if ! git_current_branch | grep -q "^$PREFIX"; then
-			die "Not on a feature branch. Name one explicitly."
-		fi
-
-		BASE=$(git merge-base "$DEVELOP_BRANCH" HEAD)
-		git diff "$BASE"
-	fi
-}
-
 cmd_checkout() {
 	parse_args "$@"
 
 	if [ "$NAME" != "" ]; then
 		expand_nameprefix_arg
-		git checkout "$BRANCH"
+		git_do checkout "$BRANCH"
 	else
 		die "Name a feature branch explicitly."
 	fi
@@ -433,13 +622,14 @@ cmd_rebase() {
 	warn "Will try to rebase '$NAME'..."
 	require_clean_working_tree
 	require_branch "$BRANCH"
+	has_tracked_branch && fail "Bad idea on shared branch."
 
-	git checkout -q "$BRANCH"
+	git_do checkout -q "$BRANCH"
 	local OPTS=
 	if flag interactive; then
 		OPTS="$OPTS -i"
 	fi
-	git rebase $OPTS "$DEVELOP_BRANCH"
+	git_do rebase $OPTS "$DEVELOP_BRANCH"
 }
 
 avoid_accidental_cross_branch_action() {
@@ -481,20 +671,20 @@ cmd_pull() {
 		# we already have a local branch called like this, so simply pull the
 		# remote changes in
 		if flag rebase; then
-			if ! git pull --rebase -q "$REMOTE" "$BRANCH"; then
+			if ! git_do pull --rebase -q "$REMOTE" "$BRANCH"; then
 				warn "Pull was aborted. There might be conflicts during rebase or '$REMOTE' might be inaccessible."
 				exit 1
 			fi
 		else
-			it pull -q "$REMOTE" "$BRANCH" || die "Failed to pull from remote '$REMOTE'."
+			git_do pull -q "$REMOTE" "$BRANCH" || die "Failed to pull from remote '$REMOTE'."
 		fi
 
 		echo "Pulled $REMOTE's changes into $BRANCH."
 	else
 		# setup the local branch clone for the first time
-		git fetch -q "$REMOTE" "$BRANCH" || die "Fetch failed."     # stores in FETCH_HEAD
-		git branch --no-track "$BRANCH" FETCH_HEAD || die "Branch failed."
-		git checkout -q "$BRANCH" || die "Checking out new local branch failed."
+		git_do fetch -q "$REMOTE" "$BRANCH" || die "Fetch failed."     # stores in FETCH_HEAD
+		git_do branch --no-track "$BRANCH" FETCH_HEAD || die "Branch failed."
+		git_do checkout -q "$BRANCH" || die "Checking out new local branch failed."
 		echo "Created local branch $BRANCH based on $REMOTE's $BRANCH."
 	fi
 }
@@ -510,7 +700,7 @@ commit_message () {
 }
 
 git_get_first_feature_branch_commit () {
-	git rev-list "$1" "^$DEVELOP_BRANCH" | tail -1
+	git rev-list --first-parent "$1" ^"$ORIGIN/$DEVELOP_BRANCH" | tail -n 1
 }
 
 git_is_feature_branch_empty () {
@@ -533,13 +723,13 @@ require_feature_branch() {
 	require_branch "$1"
 	first_feature_commit=$(git_get_first_feature_branch_commit "$1")
 	if [ -z "$first_feature_commit" ]; then
-		if ! git_is_commit_on_branch "$1" "$DEVELOP_BRANCH"; then
-			die "Current branch did NOT initially branch from '$DEVELOP_BRANCH'"
+		if ! git_is_commit_on_branch "$1" "$ORIGIN/$DEVELOP_BRANCH"; then
+			die "Current branch did NOT initially branch from '$ORIGIN/$DEVELOP_BRANCH'"
 		fi
 	else
-		if [[ "`git rev-list $first_feature_commit^ "^$DEVELOP_BRANCH" 2>&1 | wc -l`" != "0" \
-		   && "`git rev-parse $first_feature_commit^`" != "`git rev-parse $DEVELOP_BRANCH^`" ]]; then
-			die "Current branch did NOT initially branch from '$DEVELOP_BRANCH'"
+		if [[ "`git rev-list $first_feature_commit^ ^"$ORIGIN/$DEVELOP_BRANCH" 2>&1 | wc -l`" != "0" \
+		   && "`git rev-parse $first_feature_commit^`" != "`git rev-parse $ORIGIN/$DEVELOP_BRANCH^`" ]]; then
+			die "Current branch did NOT initially branch from '$ORIGIN/$DEVELOP_BRANCH'"
 		fi
 	fi
 }
@@ -562,8 +752,8 @@ git_derived_change_id() {
 }
 
 replace_change_id() {
-	sed '/^Change-Id:/d';
-	[ "$1" ] && echo "Change-Id: $1"
+	sed '/^Change-Id:/d' | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba';
+	[ "$1" ] && echo && echo "Change-Id: $1"
 }
 
 git_symbolic_head() {
@@ -606,7 +796,7 @@ nth_string () {
 }
 
 generate_squash_message() {
-	local commits=$(git log --reverse --no-merges --first-parent --pretty=format:%H "$BRANCH" ^"$DEVELOP_BRANCH")
+	local commits=$(git log --reverse --no-merges --first-parent --pretty=format:%H "$BRANCH" ^"$ORIGIN/$DEVELOP_BRANCH")
 	local count=$(echo "$commits" | wc -l)
 	[ "$count" -eq 0 ] && return 1
 	[ "$count" -eq 1 ] && {
@@ -633,7 +823,7 @@ generate_squash_message() {
 get_feature_commit_message() {
 	# Find the first commit of the feature branch
 	local first_feature_commit=$(git_get_first_feature_branch_commit "$BRANCH")
-	[ "$first_feature_commit" ] || die "Aborting: $BRANCH contains no commits on top of $DEVELOP_BRANCH."
+	[ "$first_feature_commit" ] || die "Aborting: $BRANCH contains no commits on top of $ORIGIN/$DEVELOP_BRANCH."
 
 	# The Gerrit Change-Id for the whole feature is _derived_ from the first commit
 	local first_change_id=$(git_change_id "$first_feature_commit") || fail "First commit in feature branch doesn't contain a Change-Id"
@@ -641,7 +831,7 @@ get_feature_commit_message() {
 	local message_change_id=$(git_derived_change_id message "$first_feature_commit")
 
 	# If there is a commit in the feature branch with 'message_change_id', use that for the squash commit message
-	local feature_message_commit=$(git log -1 --pretty=format:%H --grep="^Change-Id: $message_change_id" "$BRANCH" ^"$DEVELOP_BRANCH")
+	local feature_message_commit=$(git log -1 --pretty=format:%H --grep="^Change-Id: $message_change_id" "$BRANCH" ^"$ORIGIN/$DEVELOP_BRANCH")
 	if [ "$feature_message_commit" ]; then 
 		local commit_message=$(commit_message "$feature_message_commit")
 	else
@@ -688,16 +878,31 @@ cmd_message() {
 	require_feature_branch "$BRANCH"
 	require_clean_working_tree
 
-
-	local HEAD=$(git_symbolic_head)
-	trap "git checkout -q $HEAD" INT TERM EXIT
+	init_restore_branch
 	git checkout -q "$BRANCH"
 
 	edit_feature_commit_message
 }
 
+cmd_info() {
+	parse_args "$@"
+	expand_nameprefix_arg_or_current
+	require_feature_branch "$BRANCH"
+
+	local first_feature_commit=$(git_get_first_feature_branch_commit "$BRANCH")
+	[ "$first_feature_commit" ] || die "Aborting: $BRANCH contains no commits on top of $DEVELOP_BRANCH."
+
+	# The Gerrit Change-Id for the whole feature is _derived_ from the first commit
+	local feature_change_id=$(git_derived_change_id review "$first_feature_commit")
+
+	info=$(gerrit_query "$feature_change_id") \
+		|| fail "Couldn't contact Gerrit to get the change url"
+	echo "change $feature_change_id"
+	echo "----------------------------------------------"
+	echo "$info"
+}
+
 cmd_submit() {
-	DEFINE_boolean rebase false "submit with rebase" r
 	parse_args "$@"
 	expand_nameprefix_arg_or_current
 	require_feature_branch "$BRANCH"
@@ -710,9 +915,9 @@ cmd_submit() {
 	git checkout -q "$BRANCH"
 
 	# If we are tracking a remote branch, require that they are equal
-	if has "$ORIGIN/$BRANCH" $(git_remote_branches); then
-		git fetch -q "$ORIGIN" "$BRANCH:remotes/$ORIGIN/$BRANCH"
-		git_compare_branches "$BRANCH" "remotes/$ORIGIN/$BRANCH"
+	if has_tracked_branch; then
+		git fetch -q "$ORIGIN" "refs/heads/$REMOTE_BRANCH:refs/remotes/$ORIGIN/$REMOTE_BRANCH"
+		git_compare_branches "$BRANCH" "remotes/$ORIGIN/$REMOTE_BRANCH"
 		if [[ $? -ne 0 && $? -ne 2 ]]; then
 			warn "The $ORIGIN/$BRANCH has changes that are not in the local branch."
 			warn "You should probably pull to get these changes before submitting."
@@ -721,23 +926,8 @@ cmd_submit() {
 	fi
 
 	if has "$ORIGIN/$DEVELOP_BRANCH" $(git_remote_branches); then
-		git fetch -q "$ORIGIN" "$DEVELOP_BRANCH:remotes/$ORIGIN/$DEVELOP_BRANCH" || \
+		git fetch -q "$ORIGIN" "refs/heads/$DEVELOP_BRANCH:refs/remotes/$ORIGIN/$DEVELOP_BRANCH" || \
 			fail "Couldn't fetch latest $DEVELOP_BRANCH from Gerrit"
-	fi
-
-	# If the user wants to rebase, do that first
-	if flag rebase; then
-		rebase_branch=$DEVELOP_BRANCH
-		if has "$ORIGIN/$DEVELOP_BRANCH" $(git_remote_branches); then
-			rebase_branch=remotes/$ORIGIN/$DEVELOP_BRANCH
-		fi
-		if ! git flow feature rebase "$NAME" "$rebase_branch"; then
-			warn "Submit was aborted due to conflicts during rebase."
-			warn "Please finish the rebase manually now."
-			warn "When finished, re-run:"
-			warn "    git flow feature submit '$NAME'"
-			exit 1
-		fi
 	fi
 
 	# Check if merge into develop would be clean, otherwise request to merge first
@@ -775,14 +965,11 @@ cmd_submit() {
 	git checkout -q "$BRANCH"
 
 	# Push commit to gerrit for review
-	e=`git push "$ORIGIN" "$detached_head:refs/for/$DEVELOP_BRANCH" 2>&1` || {
-		echo "$e" | egrep '(error|!)' >&2
-		fail "Failed to submit change to gerrit"
-	}
+	gerrit_push "$detached_head:refs/for/$DEVELOP_BRANCH" || fail "Failed to submit change to gerrit"
 
 	# Print Summary of actions
 	change_info=$(gerrit_query "commit:${detached_head}")
-	change_no=$(echo "$change_info" | gerrit_query_filter number)
+	change_url=$(echo "$change_info" | gerrit_query_filter url)
 	change_id=$(echo "$change_info" | gerrit_query_filter id)
 	echo
 	echo "Summary of actions:"
@@ -790,7 +977,7 @@ cmd_submit() {
 	echo "  and the resulting commit was pushed to Gerrit for review:"
 	echo "      Commit:     $(git log -1 --no-color --pretty="format:(%h..) %s" "${detached_head}")"
 	echo "      Change-Id:  ${change_id}"
-	echo "      Review:     https://$(gerrit_host)/#change,${change_no}"
+	echo "      Review:     ${change_url}"
 	echo
 }
 
@@ -802,10 +989,10 @@ cmd_review() {
 	commit_head=$(git rev-parse HEAD)	
 
 	# sanity checks
-	git fetch -q "$ORIGIN" "$BRANCH:refs/remotes/$ORIGIN/$BRANCH"
+	git fetch -q "$ORIGIN" "refs/heads/$REMOTE_BRANCH:refs/remotes/$ORIGIN/$REMOTE_BRANCH"
 	# is the remote branch present on the server 
-	if ! has "$ORIGIN/$BRANCH" $(git_all_branches); then
-		warn "The $ORIGIN/$BRANCH does not exist on Gerrit."
+	if ! has "$ORIGIN/$REMOTE_BRANCH" $(git_all_branches); then
+		warn "The $ORIGIN/$REMOTE_BRANCH does not exist on Gerrit."
 		warn "You should probably use git flow feature publish."
 		warn "Aborting "
 		die
@@ -814,9 +1001,9 @@ cmd_review() {
 	git checkout -q "$BRANCH"
 	
 	# If we are tracking a remote branch, require that they are equal
-	if has "$ORIGIN/$BRANCH" $(git_remote_branches); then
-		git fetch -q "$ORIGIN" "$BRANCH:remotes/$ORIGIN/$BRANCH"
-		git_compare_branches "$BRANCH" "remotes/$ORIGIN/$BRANCH"
+	if has_tracked_branch; then
+		git fetch -q "$ORIGIN" "refs/heads/$BRANCH:refs/remotes/$ORIGIN/$REMOTE_BRANCH"
+		git_compare_branches "$BRANCH" "remotes/$ORIGIN/$REMOTE_BRANCH"
 		output_compare_branches=$?
 		if [[ $output_compare_branches == 0 ]]; then
 			warn "Local branch and remote branch are the same"
@@ -825,56 +1012,39 @@ cmd_review() {
 			die
 		fi
 		if [[ $output_compare_branches -ne 0 && $output_compare_branches -ne 2 ]]; then
-			warn "The $ORIGIN/$BRANCH has changes that are not in the local branch."
+			warn "The $ORIGIN/$REMOTE_BRANCH has changes that are not in the local branch."
 			warn "You should probably pull to get these changes before submitting."
 			ask Y "Abort now?" && die "Ok."
 		fi
 	fi
 	
 	# Push commit to gerrit for review
-	e=`git push "$ORIGIN" "HEAD:refs/for/$BRANCH" 2>&1` || {
-		echo "$e" | egrep '(error|!)' >&2
-		fail "Failed to submit change to gerrit"
-	}
+	gerrit_push "HEAD:refs/for/$REMOTE_BRANCH" || fail "Failed to submit change to gerrit"
 
 	# Display link to change
-	
-	remote=$(git config --get "remote.$ORIGIN.url")
-	host=$(echo "$remote" | sed 's,^ssh://\(.*\):.*$,\1,')
-	port=$(echo "$remote" | sed 's,^ssh://[^:]*:\([^/]*\)/.*$,\1,')
-	if [ ! -z "$host" ]; then
-		info=$(ssh -p ${port} ${host} "gerrit query commit:$commit_head")
-		rows=$(echo "$info" | awk '/^rowCount:/ {print $2}')
-		if [ "$rows" != "1" ]; then
-			fail "Could not find change in gerrit after upload. Check the web interface..."
-		fi
-		number=$(echo "$info" | awk '/^  number:/ {print $2}')
-		git log -1 --no-color --pretty="format:Commit: %Cgreen%h%Creset %s" "${commit_head}"
-		echo "        https://$host/#change,${number}"
-		echo
-	fi
+	change_info=$(gerrit_query "commit:${commit_head}")
+	change_url=$(echo "$change_info" | gerrit_query_filter url)
+	git log -1 --no-color --pretty="format:Commit: %Cgreen%h%Creset %s" "${commit_head}"
+	echo "        ${change_url}"
+	echo
 }
 
 
 
 delete_gerrit_branch() {
 	# Check if remote branch exists
-	if [ -z "$(git config --get "branch.$BRANCH.remote")" ]; then
-		return 0
-	fi
+	has_tracked_branch || return 0
 
-	# Cleanup remote branches which don't exist on origin anymore
+	# Cleanup remote branches which don't exist on $ORIGIN anymore
 	git remote prune $ORIGIN >/dev/null || "Failed to connect to $ORIGIN."
 
-	# Silently return if the tracking branch doesn't exist
-	if ! has "$ORIGIN/$BRANCH" $(git_remote_branches); then
-		return 0
-	fi
+	# Silently return if the tracking branch didn't exist anymore
+	has_tracked_branch || return 0
 
 	warn "This feature branch also seems to exist on Gerrit."
 	ask N "Also delete branch from Gerrit?" || return 1
 
-	git fetch -q "$ORIGIN" "$BRANCH" || fail "Failed to fetch from $ORIGIN."
+	git fetch -q "$ORIGIN" "$REMOTE_BRANCH" || fail "Failed to fetch from $ORIGIN."
 
 	gerrit_branch_point=$(git_get_first_feature_branch_commit FETCH_HEAD)
 	local_branch_point=$(git_get_first_feature_branch_commit "$BRANCH")
@@ -882,11 +1052,7 @@ delete_gerrit_branch() {
 		fail "Local and remote branch have different branch points. Refusing to delete remote branch."
 	fi
 
-	e=`git push "$ORIGIN" ":refs/heads/$BRANCH" 2>&1` || {
-		echo "$e" | egrep '(error|!)' >&2
-		fail "Failed to delete remote branch."
-	}
-
+	gerrit_push ":refs/heads/$REMOTE_BRANCH" || fail "Failed to delete remote branch."
 	return 2
 }
 
@@ -921,7 +1087,8 @@ cmd_delete() {
 	delete_gerrit_branch
 	remote_deleted=$?
 
-	git checkout -q "$DEVELOP_BRANCH" || fail "Couldn't checkout '$DEVELOP_BRANCH'."
+	[[ "$BRANCH" == "$(git_symbolic_head)" ]] && \
+		(git checkout -q "$DEVELOP_BRANCH" || fail "Couldn't checkout '$DEVELOP_BRANCH'.")
 
 	# delete local branch
 	git branch -D "$BRANCH" >/dev/null || fail "Couldn't delete '$BRANCH'"
@@ -931,19 +1098,49 @@ cmd_delete() {
 	[ $remote_deleted -eq 1 ] && echo "- The remote branch '$BRANCH' was kept on the server."
 	[ $remote_deleted -eq 2 ] && echo "- The remote branch '$BRANCH' was deleted"
 	echo "- The local branch '$BRANCH' was deleted"
-	echo "- You are now on branch '$DEVELOP_BRANCH'"
+	echo "- You are now on branch '$(git_symbolic_head)'"
 	echo
+}
+
+cmd_diff() {
+	if NAME=$(gitflow_resolve_nameprefix "$1" "$PREFIX" 2>/dev/null); then
+		BRANCH=$PREFIX$NAME
+		shift
+
+	## NOTE: Below hack enables 'git flow feature diff' to work on project branches.
+	##       It shouldn't theoretically be part of git-flow-feature, but is added
+	##       here for convenience. To be moved to 'git-flow-project' or something...
+
+	elif git_current_branch | grep "^${NS}${PROJECT_PREFIX}/" >/dev/null 2>/dev/null; then
+		DEVELOP_BRANCH=${NS}${DEVELOP_NAME}
+		BRANCH=$(git_current_branch)
+
+	else
+		use_current_feature_branch_name
+	fi
+
+	local BASE=$(git merge-base "$ORIGIN/$DEVELOP_BRANCH" "$BRANCH")
+	git diff "$BASE..$BRANCH" $@
 }
 
 cmd_log() {
 	if NAME=$(gitflow_resolve_nameprefix "$1" "$PREFIX" 2>/dev/null); then
 		BRANCH=$PREFIX$NAME
 		shift
+
+	## NOTE: Below hack enables 'git flow feature log' to work on project branches.
+	##       It shouldn't theoretically be part of git-flow-feature, but is added
+	##       here for convenience. To be moved to 'git-flow-project' or something...
+
+	elif git_current_branch | grep "^${NS}${PROJECT_PREFIX}/" >/dev/null 2>/dev/null; then
+		DEVELOP_BRANCH=${NS}${DEVELOP_NAME}
+		BRANCH=$(git_current_branch)
+
 	else
 		use_current_feature_branch_name
 	fi
-	require_feature_branch "$BRANCH"
 
-	git log --first-parent "$BRANCH" ^"$DEVELOP_BRANCH" $@
+	require_feature_branch "$BRANCH"
+	git log "$BRANCH" ^"$ORIGIN/$DEVELOP_BRANCH" $@
 }
 

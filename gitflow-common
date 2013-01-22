@@ -70,6 +70,14 @@ noflag() { local FLAG; eval FLAG='$FLAGS_'$1; [ $FLAG -ne $FLAGS_TRUE ]; }
 # Git specific common functionality
 #
 
+git_do() {
+  # equivalent to git, used to indicate actions that make modifications
+  if flag show_commands; then
+    echo "git $@" >&2
+  fi
+  git "$@"
+}
+
 git_local_branches() { git branch --no-color | sed 's/^[* ] //'; }
 git_remote_branches() { git branch -r --no-color | sed 's/^[* ] //'; }
 git_all_branches() { ( git branch --no-color; git branch -r --no-color) | sed 's/^[* ] //'; }
@@ -88,7 +96,7 @@ git_current_namespace() {
 	local branch=$(git_current_branch)
 	for ns in $(git_namespaces); do
 		if [ "${branch#$ns/}" != "$branch" ]; then
-			echo "$ns"
+			echo "$ns/"
 			return 0
 		fi
 	done
@@ -172,18 +180,32 @@ git_is_branch_merged_into() {
 #
 
 # check if this repo has been inited for gitflow
+gitflow_has_master_configured() {
+	local master=$(git config --get gitflow.branch.master)
+	[ "$master" != "" ] && git_local_branch_exists "$master"
+}
+
 gitflow_has_develop_configured() {
 	[ "$(git_local_branches | sed '/\/*develop$/!d')" != "" ]
 }
 
-gitflow_configure_prefixes() {
-	git config gitflow.prefix.feature feature/
+gitflow_has_prefixes_configured() {
+	git config --get gitflow.prefix.feature >/dev/null 2>&1     && \
+	git config --get gitflow.prefix.release >/dev/null 2>&1     && \
+	git config --get gitflow.prefix.hotfix >/dev/null 2>&1      && \
+	git config --get gitflow.prefix.support >/dev/null 2>&1     && \
+	git config --get gitflow.prefix.versiontag >/dev/null 2>&1
 }
 
 gitflow_is_initialized() {
 	gitflow_configure_prefixes && \
 	gitflow_has_develop_configured 
 }
+
+gitflow_configure_prefixes() {
+	git config gitflow.prefix.feature feature/
+}
+
 
 # loading settings that can be overridden using git config
 gitflow_load_settings() {
