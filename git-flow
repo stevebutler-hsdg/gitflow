@@ -40,6 +40,8 @@
 # set this to workaround expr problems in shFlags on freebsd
 if uname -s | egrep -iq 'bsd'; then export EXPR_COMPAT=1; fi
 
+if uname -s | egrep -iq 'bsd'; then export EXPR_COMPAT=1; fi
+COMMAND=`git config --get gitflow.prefix.feature | sed 's/\///g'`
 # enable debug mode
 if [ "$DEBUG" = "yes" ]; then
 	set -x
@@ -53,12 +55,7 @@ usage() {
 	echo "usage: git flow <subcommand>"
 	echo
 	echo "Available subcommands are:"
-	echo "   init      Initialize a new git repo with support for the branching model."
-	echo "   feature   Manage your feature branches."
-	echo "   release   Manage your release branches."
-	echo "   hotfix    Manage your hotfix branches."
-	echo "   support   Manage your support branches."
-	echo "   version   Shows version information."
+	echo "   $COMMAND   Manage your feature branches."
 	echo
 	echo "Try 'git flow <subcommand> help' for details."
 }
@@ -87,9 +84,15 @@ main() {
   # do actual parsing
 	FLAGS "$@" || exit $?
 	eval set -- "${FLAGS_ARGV}"
+	if [[ "$1" == "topic" ]]; then
+		# still shifting or "topic" will be used as SUBACTION
+		SUBCOMMAND="$1"; shift
+		SUBCOMMAND=feature
 
+	else
+		SUBCOMMAND="$1"; shift
+	fi
 	# sanity checks
-	SUBCOMMAND="$1"; shift
 
 	if [ ! -e "$GITFLOW_DIR/git-flow-$SUBCOMMAND" ]; then
 		usage
@@ -114,10 +117,7 @@ main() {
 	fi
 
 	# run the specified action
-  if [ $SUBACTION != "help" ] && [ $SUBCOMMAND != "init" ] ; then
-    init
-  fi
-  cmd_$SUBACTION "$@"
+	cmd_$SUBACTION "$@"
 }
 
 main "$@"
